@@ -226,6 +226,7 @@ sudo ip link set vx-welt up
 - Publishing metrics worker->broker: `wireguard-metrics/{domain}/{worker}/connected_peers`
 - Publishing worker status: `wireguard-worker/{worker}/status`
 - Publishing worker data: `wireguard-worker/{worker}/{domain}/data`
+- Publishing broker status: `wireguard-broker/{broker}/status`
 
 ## Contact
 

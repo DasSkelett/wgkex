@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import re
+import socket
 from typing import Any, Dict, List, Tuple
 
 import paho.mqtt.client as mqtt_client
@@ -17,11 +18,13 @@ from wgkex.common.utils import is_valid_domain
 from wgkex.broker.metrics import WorkerMetricsCollection
 from wgkex.common.mqtt import (
     CONNECTED_PEERS_METRIC,
+    TOPIC_BROKER_STATUS,
     TOPIC_WORKER_STATUS,
     TOPIC_WORKER_WG_DATA,
 )
 
 WG_PUBKEY_PATTERN = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$")
+_HOSTNAME = socket.gethostname()
 
 
 @dataclasses.dataclass
@@ -88,6 +91,18 @@ class WorkerData:
         )
 
 
+@dataclasses.dataclass
+class BrokerStatus:
+    """A key exchange message. TODO
+
+    Attributes:
+        public_key: The public key for this exchange.
+        domain: The domain for this exchange.
+    """
+
+    online: bool
+
+
 def _fetch_app_config() -> Flask_app:
     """Creates the Flask app from configuration.
 
@@ -105,14 +120,29 @@ def _fetch_app_config() -> Flask_app:
     return app
 
 
+"""
+Setup
+"""
+
 app = _fetch_app_config()
 mqtt = Mqtt(app)
+# Register LWT to set worker status down when lossing connection
+mqtt.client.will_set(
+    TOPIC_BROKER_STATUS.format(broker=_HOSTNAME), 0, qos=1, retain=True
+)
 # worker_metrics holds data like connected peers per domain
 worker_metrics = WorkerMetricsCollection()
 # worker_data holds worker connectivity data relevant for clients per domain, like endpoint and pubkey
 # { (worker, domain): WorkerData }
 worker_data: Dict[Tuple[str, str], WorkerData] = {}
+# broker_status tracks ther amount of broker instances running
+# { broker: BrokerStatus }
+broker_status: Dict[str, BrokerStatus] = {}
 
+
+"""
+HTTP section
+"""
 
 @app.route("/", methods=["GET"])
 def index() -> str:
@@ -137,7 +167,7 @@ def wg_api_v1_key_exchange() -> Tuple[Response | Dict, int]:
     gateway = "all"
     logger.info(f"wg_api_v1_key_exchange: Domain: {domain}, Key:{key}")
 
-    mqtt.publish(f"wireguard/{domain}/{gateway}", key)
+    mqtt.client.publish(f"wireguard/{domain}/{gateway}", key)
     return {"Message": "OK"}, 200
 
 
@@ -159,7 +189,7 @@ def wg_api_v2_key_exchange() -> Tuple[Response | Dict, int]:
     gateway = "all"
     logger.info(f"wg_api_v2_key_exchange: Domain: {domain}, Key:{key}")
 
-    mqtt.publish(f"wireguard/{domain}/{gateway}", key)
+    mqtt.client.publish(f"wireguard/{domain}/{gateway}", key)
 
     best_worker, diff, current_peers = worker_metrics.get_best_worker(domain)
     if best_worker is None:
@@ -170,15 +200,21 @@ def wg_api_v2_key_exchange() -> Tuple[Response | Dict, int]:
             }
         }, 400
 
-    # Update number of peers locally to interpolate data between MQTT updates from the worker
+    # Update number of peers locally to interpolate data between MQTT updates from the worker.
+    # Increment it by the number of active brokers, assuming every broker gets roughly the same number of key exchange requests.
     # TODO fix data race
+    online_brokers = sum(1 if broker.online else 0 for broker in broker_status.values())
+
     current_peers_domain = (
         worker_metrics.get(best_worker)
         .get_domain_metrics(domain)
         .get(CONNECTED_PEERS_METRIC, 0)
     )
     worker_metrics.update(
-        best_worker, domain, CONNECTED_PEERS_METRIC, current_peers_domain + 1
+        best_worker,
+        domain,
+        CONNECTED_PEERS_METRIC,
+        current_peers_domain + online_brokers,
     )
     logger.debug(
         f"Chose worker {best_worker} with {current_peers} connected clients ({diff})"
@@ -199,6 +235,20 @@ def wg_api_v2_key_exchange() -> Tuple[Response | Dict, int]:
     return {"Endpoint": endpoint}, 200
 
 
+@app.route("/status", methods=["GET"])
+def status() -> Tuple[Response | str, int]:
+    response = ""
+    response += f"online-brokers: {sum(1 if broker.online else 0 for broker in broker_status.values())}\n"
+    response += f"online-workers: {sum(1 if worker.is_online() else 0 for worker in worker_metrics.data.values())}\n"
+    response += f"total-peers: {worker_metrics.get_total_peer_count()}\n"
+
+    return Response(response, mimetype="text/plain"), 200
+
+
+"""
+MQTT section
+"""
+
 @mqtt.on_connect()
 def handle_mqtt_connect(
     client: mqtt_client.Client, userdata: bytes, flags: Any, rc: Any
@@ -210,9 +260,11 @@ def handle_mqtt_connect(
             app.config["MQTT_BROKER_URL"], app.config["MQTT_BROKER_PORT"]
         )
     )
-    mqtt.subscribe("wireguard-metrics/#")
-    mqtt.subscribe(TOPIC_WORKER_STATUS.format(worker="+"))
-    mqtt.subscribe(TOPIC_WORKER_WG_DATA.format(worker="+", domain="+"))
+    client.subscribe("wireguard-metrics/#")
+    client.subscribe(TOPIC_WORKER_STATUS.format(worker="+"))
+    client.subscribe(TOPIC_WORKER_WG_DATA.format(worker="+", domain="+"))
+    client.subscribe(TOPIC_BROKER_STATUS.format(broker="+"))
+    client.publish(TOPIC_BROKER_STATUS.format(broker=_HOSTNAME), 1, qos=1, retain=True)
 
 
 @mqtt.on_topic("wireguard-metrics/#")
@@ -239,7 +291,7 @@ def handle_mqtt_message_metrics(
 
 
 @mqtt.on_topic(TOPIC_WORKER_STATUS.format(worker="+"))
-def handle_mqtt_message_status(
+def handle_mqtt_message_worker_status(
     client: mqtt_client.Client, userdata: bytes, message: mqtt_client.MQTTMessage
 ) -> None:
     """Processes status messages from workers."""
@@ -278,6 +330,27 @@ def handle_mqtt_message_data(
 
     logger.info("Worker data received for %s/%s: %s", worker, domain, w_data)
     worker_data[(worker, domain)] = w_data
+
+
+@mqtt.on_topic(TOPIC_BROKER_STATUS.format(broker="+"))
+def handle_mqtt_message_broker_status(
+    client: mqtt_client.Client, userdata: bytes, message: mqtt_client.MQTTMessage
+) -> None:
+    """Processes status messages from brokers."""
+    _, broker, _ = message.topic.split("/", 2)
+
+    status = int(message.payload)
+    broker_status_data = broker_status.get(broker)
+    if broker_status_data is None:
+        # New broker
+        if status >= 1:
+            broker_status[broker] = BrokerStatus(True)
+    elif status < 1 and broker_status_data.online:
+        logger.warning(f"Marking broker as offline: {broker}")
+        broker_status_data.online = False
+    elif status >= 1 and not broker_status_data.online:
+        logger.info(f"Marking broker as online: {broker}")
+        broker_status_data.online = True
 
 
 @mqtt.on_message()

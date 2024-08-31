@@ -41,7 +41,7 @@ def connect(exit_event: threading.Event) -> None:
     client = mqtt.Client(_HOSTNAME)
     domains = get_config().domains
 
-    # Register LWT to set worker status down when lossing connection
+    # Register LWT to set worker status down when loosing connection
     client.will_set(TOPIC_WORKER_STATUS.format(worker=_HOSTNAME), 0, qos=1, retain=True)
 
     # Register handlers
