@@ -3,7 +3,7 @@
 import dataclasses
 import json
 import re
-from typing import Dict, Tuple, Any
+from typing import Any, Dict, List, Tuple
 
 import paho.mqtt.client as mqtt_client
 from flask import Flask, render_template, request, Response
@@ -52,6 +52,42 @@ class KeyExchange:
         return cls(public_key=public_key, domain=domain)
 
 
+@dataclasses.dataclass
+class WorkerData:
+    """A key exchange message. TODO
+
+    Attributes:
+        public_key: The public key for this exchange.
+        domain: The domain for this exchange.
+    """
+
+    external_address: str
+    port: int
+    link_address: str
+    public_key: str
+
+    @classmethod
+    def from_dict(cls, msg: dict) -> "WorkerData":
+        """Creates a new WorkerData object from dict.
+
+        Arguments:
+            msg: The message to convert.
+        Returns:
+            A WorkerData object.
+        """
+        external_address = str(msg.get("ExternalAddress"))
+        port = int(msg.get("Port"))
+        link_address = str(link_address)
+        public_key = is_valid_wg_pubkey(str(msg.get("PublicKey")))
+
+        return cls(
+            external_address=external_address,
+            port=port,
+            link_address=link_address,
+            public_key=public_key,
+        )
+
+
 def _fetch_app_config() -> Flask_app:
     """Creates the Flask app from configuration.
 
@@ -71,8 +107,11 @@ def _fetch_app_config() -> Flask_app:
 
 app = _fetch_app_config()
 mqtt = Mqtt(app)
+# worker_metrics holds data like connected peers per domain
 worker_metrics = WorkerMetricsCollection()
-worker_data: Dict[Tuple[str, str], Dict] = {}
+# worker_data holds worker connectivity data relevant for clients per domain, like endpoint and pubkey
+# { (worker, domain): WorkerData }
+worker_data: Dict[Tuple[str, str], WorkerData] = {}
 
 
 @app.route("/", methods=["GET"])
@@ -151,10 +190,10 @@ def wg_api_v2_key_exchange() -> Tuple[Response | Dict, int]:
         return {"error": {"message": "could not get gateway data"}}, 500
 
     endpoint = {
-        "Address": w_data.get("ExternalAddress"),
-        "Port": str(w_data.get("Port")),
-        "AllowedIPs": [w_data.get("LinkAddress")],
-        "PublicKey": w_data.get("PublicKey"),
+        "Address": w_data.external_address,
+        "Port": str(w_data.port),
+        "AllowedIPs": [w_data.link_address],
+        "PublicKey": w_data.public_key,
     }
 
     return {"Endpoint": endpoint}, 200
@@ -227,13 +266,18 @@ def handle_mqtt_message_data(
         logger.error(f"Domain {domain} not in configured domains.")
         return
 
-    data = json.loads(message.payload)
-    if not isinstance(data, dict):
-        logger.error("Invalid worker data received for %s/%s: %s", worker, domain, data)
+    msg = json.loads(message.payload)
+    if not isinstance(msg, dict):
+        logger.error("Invalid worker data received for %s/%s: %s", worker, domain, msg)
+        return
+    try:
+        w_data = WorkerData.from_dict(msg)
+    except:
+        logger.error("Invalid worker data received for %s/%s: %s", worker, domain, msg)
         return
 
-    logger.info("Worker data received for %s/%s: %s", worker, domain, data)
-    worker_data[(worker, domain)] = data
+    logger.info("Worker data received for %s/%s: %s", worker, domain, w_data)
+    worker_data[(worker, domain)] = w_data
 
 
 @mqtt.on_message()
